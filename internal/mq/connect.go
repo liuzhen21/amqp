@@ -17,10 +17,12 @@ import (
 func Connect(ctx context.Context, topics string) {
 	keepRunning := true
 	fmt.Println("Starting a new Sarama consumer")
+	ctx, cancel := context.WithCancel(ctx)
 
 	version, err := sarama.ParseKafkaVersion(_KafkaVersion)
 	if err != nil {
-		log.Panicf("Error parsing Kafka version: %v", err)
+		log.Errorf("Error parsing Kafka version: %v", err)
+		return
 	}
 
 	/**
@@ -49,13 +51,15 @@ func Connect(ctx context.Context, topics string) {
 	 * Setup a new Sarama consumer group
 	 */
 	consumer := Consumer{
-		ready: make(chan bool),
-		ctx:   ctx,
+		ready:  make(chan bool),
+		ctx:    ctx,
+		cancel: cancel,
 	}
 
 	client, err := sarama.NewConsumerGroup(strings.Split(_BrokersStr, ","), _ConsumerGroup, config)
 	if err != nil {
-		log.Panicf("Error creating consumer group client: %v", err)
+		log.Errorf("Error creating consumer group client: %v", err)
+		return
 	}
 
 	consumptionIsPaused := false
@@ -68,10 +72,13 @@ func Connect(ctx context.Context, topics string) {
 			// server-side rebalance happens, the consumer session will need to be
 			// recreated to get the new claims
 			if err := client.Consume(ctx, strings.Split(topics, ","), &consumer); err != nil {
-				log.Panicf("Error from consumer: %v", err)
+				log.Errorf("Error from consumer: %v", err)
+				keepRunning = false
+				return
 			}
 			// check if context was cancelled, signaling that the consumer should stop
 			if ctx.Err() != nil {
+				keepRunning = false
 				return
 			}
 			consumer.ready = make(chan bool)
@@ -101,7 +108,7 @@ func Connect(ctx context.Context, topics string) {
 	}
 	wg.Wait()
 	if err = client.Close(); err != nil {
-		log.Panicf("Error closing client: %v", err)
+		log.Errorf("Error closing client: %v", err)
 	}
 }
 
@@ -119,8 +126,9 @@ func toggleConsumptionFlow(client sarama.ConsumerGroup, isPaused *bool) {
 
 // Consumer represents a Sarama consumer group consumer
 type Consumer struct {
-	ctx   context.Context
-	ready chan bool
+	ctx    context.Context
+	cancel context.CancelFunc
+	ready  chan bool
 }
 
 // Setup is run at the beginning of a new session, before ConsumeClaim
@@ -136,6 +144,7 @@ func (consumer *Consumer) Cleanup(sarama.ConsumerGroupSession) error {
 	if !ok {
 		return errors.New("id not found in context")
 	}
+	consumer.cancel()
 	ShutdownChan(id)
 	return nil
 }
@@ -157,6 +166,8 @@ func (consumer *Consumer) ConsumeClaim(session sarama.ConsumerGroupSession, clai
 			return err
 		}
 		select {
+		case <-consumer.ctx.Done():
+			return nil
 		case ch <- data:
 			log.Info("get data from subscription kafka topic: ", data)
 		}
